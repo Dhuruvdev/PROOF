@@ -208,9 +208,11 @@ def main() -> int:
             "pluginsCount": 5, "hardwareConcurrency": 8, "deviceMemory": 8,
             "screenWidth": 1920, "screenHeight": 1080, "timezone": "Asia/Kolkata",
             "timezoneOffsetMinutes": 330, "webdriver": False, "chromeRuntime": True,
-            "automationProps": [], "canvasHash": "deadbeef" * 16,
+            "automationProps": [],
+            # Realistic uniformly-distributed SHA-256 hex (a real GPU canvas FP):
+            "canvasHash": "9f1c6a37b04e8d215c70a9e3f8b62d4a7e15c980fa3d6b2c47e91ab305f8d6c2",
             "webglRenderer": "NVIDIA RTX 4070", "webglVendor": "NVIDIA",
-            "audioHash": "35.7449712753", "fontsDetected": 32,
+            "audioHash": "a7e2b48c1d9f5063e7c12a48b9d0f5e2", "fontsDetected": 32,
             "rtcLocalIp": "192.168.1.27",
             "pointerIntervalsMs": [12,14,9,22,18,15,11,19,13,17,21],
             "scrollCount": 6, "focusEvents": 2, "challengeSolveMs": 180,

@@ -437,6 +437,7 @@ class ProofProtocol:
             reputation_score=rep_score,
             replay_seen_before=replay_seen,
             relying_party_min_action=min_action,
+            pow_difficulty_bits=int(challenge.difficulty),
         )
 
         success = decision.action in (Action.ALLOW, Action.ALLOW_WITH_INTERACTION)

@@ -158,6 +158,40 @@ def _shannon_bits_of(s: str) -> float:
     return h * len(set(s))  # rough total-entropy proxy
 
 
+def _smallest_period(s: str) -> int:
+    """Return the length of the smallest repeating substring of ``s``.
+
+    A real GPU canvas / WebGL / audio fingerprint is the SHA-256 of pixel
+    data so its hex string is essentially uniformly distributed — its
+    smallest period equals its full length. A fabricated string like
+    ``"a1b2c3d4" * 16`` has period 8, which is a dead giveaway.
+    """
+    n = len(s)
+    if n == 0:
+        return 0
+    for p in range(1, n // 2 + 1):
+        if n % p != 0:
+            continue
+        if s[:p] * (n // p) == s:
+            return p
+    return n
+
+
+def _looks_fabricated(hash_str: str) -> bool:
+    """Heuristic: a real cryptographic hash never has a small period and
+    never has fewer than 8 unique hex characters out of the 16 possible."""
+    if not hash_str or len(hash_str) < 16:
+        return False  # absence handled by other rules
+    period = _smallest_period(hash_str)
+    if period < len(hash_str) // 2:
+        return True
+    unique = len(set(hash_str))
+    # SHA-256 hex over real entropy: P(unique<8 in 64 chars) ≈ 1.6e-9
+    if len(hash_str) >= 64 and unique < 8:
+        return True
+    return False
+
+
 def _is_private_ip(ip: str) -> bool:
     if not ip:
         return False
@@ -245,8 +279,12 @@ def analyze(payload: dict[str, Any]) -> TelemetrySummary:
     # ---- Canvas / WebGL / Audio -------------------------------------------
     canvas_hash = str(raw.get("canvasHash") or "")
     canvas_entropy = _shannon_bits_of(canvas_hash)
+    canvas_fabricated = _looks_fabricated(canvas_hash)
     _flag(flags, canvas_hash == "" or canvas_entropy < 10,
           "Canvas fingerprint is empty or low-entropy")
+    _flag(flags, canvas_fabricated,
+          "Canvas fingerprint shows a repeating / low-variety pattern — "
+          "real GPU output is uniformly distributed (likely fabricated)")
 
     webgl_renderer = str(raw.get("webglRenderer") or "")
     webgl_vendor = str(raw.get("webglVendor") or "")
@@ -256,7 +294,10 @@ def analyze(payload: dict[str, Any]) -> TelemetrySummary:
 
     audio_hash = str(raw.get("audioHash") or "")
     audio_entropy = _shannon_bits_of(audio_hash)
+    audio_fabricated = _looks_fabricated(audio_hash)
     _flag(flags, audio_hash == "", "AudioContext fingerprint missing")
+    _flag(flags, audio_fabricated,
+          "AudioContext fingerprint shows a repeating / low-variety pattern")
 
     # ---- WebRTC ------------------------------------------------------------
     rtc_local = str(raw.get("rtcLocalIp") or "")
@@ -349,8 +390,18 @@ def analyze(payload: dict[str, Any]) -> TelemetrySummary:
     fingerprint = hashlib.sha256("|".join(fp_parts).encode("utf-8")).hexdigest()[:32]
 
     # ---- Cheap rule-based suspicion (pre-ML) -------------------------------
+    # Fabricated cryptographic-hash strings are the single strongest signal of
+    # a hand-crafted forgery: a real GPU/audio context produces uniformly
+    # distributed bytes. A real human cannot accidentally trigger this rule.
+    no_behavior_at_all = (
+        pointer_path_length == 0 and scroll_count == 0 and focus_events == 0
+        and not parsed_dict["is_mobile"]
+    )
     s = 0.0
     s += 35 if parsed_dict["is_bot"] else 0
+    s += 30 if canvas_fabricated else 0
+    s += 20 if audio_fabricated else 0
+    s += 25 if no_behavior_at_all else 0
     s += 25 if webdriver_present else 0
     s += min(20, automation_flag_count * 5)
     s += 12 if webgl_known_bad else 0
@@ -361,6 +412,11 @@ def analyze(payload: dict[str, Any]) -> TelemetrySummary:
     s += 6 if pointer_path_length == 0 and not parsed_dict["is_mobile"] else 0
     s += 4 if not timezone_consistency else 0
     s += 4 if canvas_entropy < 10 else 0
+    if no_behavior_at_all:
+        flags.append(
+            "No pointer, scroll, or focus events recorded on a desktop browser "
+            "— a human had to interact with the widget to submit it"
+        )
     suspicion_score = float(min(100.0, s))
 
     return TelemetrySummary(

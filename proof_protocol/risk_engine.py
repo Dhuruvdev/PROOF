@@ -146,6 +146,7 @@ def evaluate(
     reputation_score: float,
     replay_seen_before: bool,
     relying_party_min_action: Action = Action.ALLOW,
+    pow_difficulty_bits: int = 0,
 ) -> RiskDecision:
     reasons: list[str] = []
     components: dict[str, float] = {}
@@ -163,8 +164,23 @@ def evaluate(
     # PoW contribution
     if pow_solved:
         components["pow"] = 0.0
+        # Physics check: a SHA-256 PoW of 2^d expected hashes runs at
+        # ~1.5 M H/s in real browser JavaScript (V8/SpiderMonkey can't go
+        # much above 3 M H/s for sub-resource isolated workers). A native
+        # solver claiming 200 M+ H/s is the most reliable headless tell:
+        # there is no real desktop browser that can do it.
+        if pow_difficulty_bits >= 12:
+            expected_hashes = 2 ** (pow_difficulty_bits - 1)
+            min_realistic_ms = (expected_hashes / 3_000_000.0) * 1000.0
+            if pow_elapsed_ms < min_realistic_ms / 4.0:
+                components["pow"] = 50.0
+                reasons.append(
+                    f"Proof-of-work (difficulty {pow_difficulty_bits} bits) solved in "
+                    f"{pow_elapsed_ms:.0f} ms; a real browser needs ≥{min_realistic_ms:.0f} ms — "
+                    "client is using a native (non-browser) solver"
+                )
         if pow_elapsed_ms < 5:
-            components["pow"] = 35.0
+            components["pow"] = max(components["pow"], 35.0)
             reasons.append(f"Proof-of-work solved in {pow_elapsed_ms:.0f} ms — implausibly fast for a real browser")
     else:
         components["pow"] = 60.0
