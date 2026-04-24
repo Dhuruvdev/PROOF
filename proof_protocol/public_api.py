@@ -644,6 +644,20 @@ def build_app(protocol: ProofProtocol) -> FastAPI:
         # Serve an empty 204 so browsers stop logging 404s.
         return Response(status_code=204)
 
+    @app.head("/")
+    def interstitial_head() -> Response:
+        # Reverse proxies (incl. the Replit dev proxy) probe with HEAD;
+        # returning 405 here marks the upstream unhealthy and the proxy
+        # then 502s every real GET. A bare 200 keeps the proxy happy.
+        return Response(
+            status_code=200,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.head("/privacy")
+    def privacy_head() -> Response:
+        return Response(status_code=200)
+
     @app.get("/", response_class=HTMLResponse)
     def interstitial(request: Request) -> HTMLResponse:
         site = _demo_site()
