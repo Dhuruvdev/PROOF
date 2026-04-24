@@ -179,7 +179,7 @@ _INTERSTITIAL_HTML = r"""<!DOCTYPE html>
        <a href="#">Privacy</a></div>
 </div>
 
-<script src="__API__/api/widget.js"></script>
+<script src="/api/widget.js"></script>
 <script>
 (function() {
   "use strict";
@@ -391,13 +391,11 @@ def build_app(protocol: ProofProtocol) -> FastAPI:
     def interstitial(request: Request) -> HTMLResponse:
         site = _demo_site()
         ray_id = "PR-" + secrets.token_hex(10)
-        api_base = str(request.base_url).rstrip("/")
         hostname = _hostname_from_request(request)
         body = _render(
             _INTERSTITIAL_HTML,
             HOSTNAME=html.escape(hostname),
             RAY_ID=html.escape(ray_id),
-            API=html.escape(api_base),
             SITEKEY_JSON=json.dumps(site.site_key),
             RAY_JSON=json.dumps(ray_id),
         )
@@ -412,8 +410,9 @@ def build_app(protocol: ProofProtocol) -> FastAPI:
 
     @app.get("/api/widget.js", response_class=PlainTextResponse)
     def widget(request: Request) -> Response:
-        base = str(request.base_url).rstrip("/")
-        js = widget_javascript(base)
+        # Use a relative API base so the widget always calls its own origin
+        # (works behind reverse proxies, mixed-protocol setups, custom domains).
+        js = widget_javascript("")
         return Response(
             content=js,
             media_type="application/javascript; charset=utf-8",

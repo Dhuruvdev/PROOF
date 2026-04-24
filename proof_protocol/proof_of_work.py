@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass
 
 
-_DEFAULT_DIFFICULTY = 18      # ~262K hashes; ~50–200 ms in modern JS
+_DEFAULT_DIFFICULTY = 12      # ~4K hashes; ~50–250 ms even on mobile/low-end
 MIN_DIFFICULTY = 8
 MAX_DIFFICULTY = 26
 CHALLENGE_TTL_SECONDS = 120

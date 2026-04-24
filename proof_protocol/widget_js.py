@@ -206,6 +206,7 @@ _WIDGET_JS = r"""
     const buf = new Uint8Array(idBytes.length + 8);
     buf.set(idBytes, 0);
     const t0 = performance.now();
+    // Yield to the event loop periodically so the spinner keeps animating.
     for (let nonce = 0; nonce < (1 << 24); nonce++) {
       // big-endian 8-byte nonce
       buf[idBytes.length + 0] = 0;
@@ -220,8 +221,10 @@ _WIDGET_JS = r"""
       if (leadingZeroBits(hex) >= difficulty) {
         return {nonce: nonce, elapsed_seconds: (performance.now() - t0) / 1000};
       }
-      if ((nonce & 0xff) === 0 && (performance.now() - t0) > 8000) {
-        throw new Error("PoW timed out (browser too slow or difficulty too high)");
+      // Generous 30s timeout so even slow phones / battery-saver mode finish.
+      if ((nonce & 0xff) === 0 && (performance.now() - t0) > 30000) {
+        throw new Error("PoW timed out at nonce " + nonce +
+                        " (difficulty " + difficulty + " bits)");
       }
     }
     throw new Error("PoW exhausted iteration budget");
