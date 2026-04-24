@@ -40,16 +40,19 @@ from proof_protocol.trust_tiers import POLICIES
 
 
 def _api_base() -> str:
-    """The public URL where the FastAPI server is reachable."""
+    """The public URL where the FastAPI server is reachable.
+
+    On Replit, port 8000 is exposed externally at ``https://<dev-domain>:8000/``
+    (configured via ``[[ports]]`` in ``.replit``). When this app is shown to
+    a user via the preview pane we must hand them that public URL — the
+    ``localhost`` fallback only works inside the workspace container.
+    """
     explicit = os.environ.get("PROOF_API_BASE")
     if explicit:
         return explicit.rstrip("/")
     domain = os.environ.get("REPLIT_DEV_DOMAIN")
     if domain:
-        # FastAPI runs on a separate port; on Replit only port 5000 is proxied
-        # via the dev domain, so direct external access to 8000 isn't possible
-        # without explicit configuration. The user can override via env var.
-        return f"http://localhost:8000"
+        return f"https://{domain}:8000"
     return "http://localhost:8000"
 
 
@@ -674,6 +677,27 @@ def page_live_widget(proto: ProofProtocol) -> None:
 
     api = _api_base()
     st.caption(f"API base: `{api}`")
+
+    st.subheader("Open the Cloudflare-style verification interstitial")
+    st.write(
+        "Click **Open** below to open the *real* PROOF interstitial in a new "
+        "tab — the same kind of `Performing security verification` page "
+        "Cloudflare shows. It will run a live PoW + telemetry + risk-engine "
+        "check on your browser, then redirect to the protected page on "
+        "success or show a Cloudflare-style block screen on failure."
+    )
+    open_url = f"{api}/verify?sitekey={sitekey}&destination=/protected"
+    st.markdown(
+        f'<a href="{open_url}" target="_blank" rel="noopener" '
+        f'style="display:inline-block;background:#3da25f;color:#fff;'
+        f'padding:10px 22px;border-radius:4px;text-decoration:none;'
+        f'font-weight:700;font-size:15px;margin:6px 0 14px;">Open</a>',
+        unsafe_allow_html=True,
+    )
+    st.caption(f"Opens: `{open_url}`")
+
+    st.divider()
+    st.subheader("Embedded inline widget (checkbox flow)")
 
     components.html(
         f"""
