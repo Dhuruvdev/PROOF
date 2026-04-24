@@ -296,9 +296,6 @@ _HOME_HTML = r"""<!DOCTYPE html>
      response token, which the relying-party backend consumes via
      <code>POST /api/siteverify</code>.</p>
   __OPEN_BUTTON__
-  <p style="margin-top:24px;font-size:13px;color:#9aa1a6;">
-     No demo site is registered yet. Open the Streamlit admin (port 5000),
-     go to <em>7. Sites</em>, register one, then refresh this page.</p>
 </div></body></html>"""
 
 

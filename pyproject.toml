@@ -15,7 +15,6 @@ dependencies = [
     "requests>=2.33.1",
     "scikit-learn>=1.8.0",
     "scipy>=1.17.1",
-    "streamlit>=1.56.0",
     "user-agents>=2.2.0",
     "uvicorn[standard]>=0.46.0",
 ]
