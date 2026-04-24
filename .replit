@@ -1,8 +1,9 @@
-modules = ["nodejs-24", "python-3.11"]
+modules = ["nodejs-20", "python-3.11", "web"]
 
 [deployment]
 router = "application"
 deploymentTarget = "autoscale"
+run = ["streamlit", "run", "app.py", "--server.port", "5000"]
 
 [deployment.postBuild]
 args = ["pnpm", "store", "prune"]
@@ -48,7 +49,7 @@ task = "shell.exec"
 args = "python serve_api.py"
 
 [agent]
-stack = "PNPM_WORKSPACE"
+stack = "STREAMLIT"
 expertMode = true
 
 [postMerge]
