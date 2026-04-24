@@ -14,13 +14,17 @@ from pathlib import Path
 
 from . import crypto_primitives as cp
 from .pedersen import commit, verify_opening
+from .proof_of_work import ProofOfWorkIssuer, solve, _meets_difficulty
 from .protocol import ProofProtocol, Tier
+from .replay_protection import ReplayGuard
+from .risk_engine import Action, anomaly_score, evaluate as risk_evaluate
 from .schnorr_zkp import (
     prove_commitment_knowledge,
     schnorr_sign,
     schnorr_verify,
     verify_commitment_knowledge,
 )
+from .telemetry import analyze
 
 
 def _synthetic_keystrokes(seed: int = 0, count: int = 30) -> list[dict]:
@@ -174,6 +178,123 @@ def main() -> int:
         rows = proto.db.recent_audit(limit=20)
         assert len(rows) >= 5
         print(f" [ok] audit log captured {len(rows)} events")
+
+        # ----- Phase 2: PoW + telemetry + risk engine + sites ---------------
+
+        # Hashcash: forged challenge MAC must be rejected
+        pow_issuer = ProofOfWorkIssuer(secret_key=b"X" * 32, base_difficulty=12)
+        ch = pow_issuer.issue()
+        sol = solve(ch)
+        ok, why = pow_issuer.verify(ch, sol)
+        assert ok, why
+        # Lower difficulty advertised by client must fail MAC check
+        from .proof_of_work import PowChallenge
+        forged = PowChallenge(challenge_id=ch.challenge_id, difficulty=4,
+                              issued_at=ch.issued_at, expires_at=ch.expires_at,
+                              issuer_mac=ch.issuer_mac)
+        ok2, _ = pow_issuer.verify(forged, sol)
+        assert not ok2, "downgraded-difficulty challenge should fail MAC"
+        # And the underlying primitive itself
+        assert _meets_difficulty(ch.challenge_id, sol.nonce, ch.difficulty)
+        print(f" [ok] proof-of-work issued, solved (nonce={sol.nonce}, "
+              f"difficulty={ch.difficulty}), MAC-tamper rejected")
+
+        # Telemetry: clean human vs headless bot
+        clean = analyze({
+            "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                         "AppleWebKit/537.36 (KHTML, like Gecko) "
+                         "Chrome/138.0.0.0 Safari/537.36",
+            "languages": ["en-US","en"], "languagesCount": 2,
+            "pluginsCount": 5, "hardwareConcurrency": 8, "deviceMemory": 8,
+            "screenWidth": 1920, "screenHeight": 1080, "timezone": "Asia/Kolkata",
+            "timezoneOffsetMinutes": 330, "webdriver": False, "chromeRuntime": True,
+            "automationProps": [], "canvasHash": "deadbeef" * 16,
+            "webglRenderer": "NVIDIA RTX 4070", "webglVendor": "NVIDIA",
+            "audioHash": "35.7449712753", "fontsDetected": 32,
+            "rtcLocalIp": "192.168.1.27",
+            "pointerIntervalsMs": [12,14,9,22,18,15,11,19,13,17,21],
+            "scrollCount": 6, "focusEvents": 2, "challengeSolveMs": 180,
+            "requestAgeSeconds": 0.8, "batteryPresent": True,
+        })
+        bot = analyze({
+            "userAgent": "Mozilla/5.0 (X11; Linux x86_64) HeadlessChrome/138.0.0.0",
+            "languages": [], "languagesCount": 0,
+            "pluginsCount": 0, "hardwareConcurrency": 2, "deviceMemory": 0,
+            "screenWidth": 800, "screenHeight": 600, "timezone": "UTC",
+            "timezoneOffsetMinutes": 0, "webdriver": True, "chromeRuntime": False,
+            "automationProps": ["webdriver","__playwright","puppeteer"],
+            "canvasHash": "", "webglRenderer": "Google SwiftShader",
+            "webglVendor": "Google Inc.", "audioHash": "",
+            "fontsDetected": 1, "rtcLocalIp": "",
+            "pointerIntervalsMs": [], "scrollCount": 0, "focusEvents": 0,
+            "challengeSolveMs": 2, "requestAgeSeconds": 0.05,
+        })
+        assert clean.suspicion_score < 20, f"clean score too high: {clean.suspicion_score}"
+        assert bot.suspicion_score > 70, f"bot score too low: {bot.suspicion_score}"
+        assert any("HeadlessChrome" in f or "headless" in f.lower() for f in bot.risk_flags)
+        assert any("webdriver" in f.lower() for f in bot.risk_flags)
+        print(f" [ok] telemetry: clean={clean.suspicion_score:.0f}, bot={bot.suspicion_score:.0f}, "
+              f"bot raised {len(bot.risk_flags)} flags")
+
+        # Anomaly model is deterministic and ranks bots above humans
+        a_clean = anomaly_score(clean.feature_vector)
+        a_bot = anomaly_score(bot.feature_vector)
+        assert a_bot > a_clean, f"anomaly should rank bot > clean (got {a_bot:.1f} vs {a_clean:.1f})"
+        print(f" [ok] IsolationForest anomaly: clean={a_clean:.1f}, bot={a_bot:.1f}")
+
+        # Risk engine end-to-end
+        d_clean = risk_evaluate(clean, pow_solved=True, pow_elapsed_ms=180,
+                                behavioral_distance=0.05, reputation_score=100,
+                                replay_seen_before=False)
+        d_bot = risk_evaluate(bot, pow_solved=False, pow_elapsed_ms=2,
+                              behavioral_distance=None, reputation_score=20,
+                              replay_seen_before=False)
+        assert d_clean.action in (Action.ALLOW, Action.ALLOW_WITH_INTERACTION), \
+            f"clean human got {d_clean.action} ({d_clean.score:.1f})"
+        assert d_bot.action in (Action.CHALLENGE, Action.BLOCK), \
+            f"bot got {d_bot.action} ({d_bot.score:.1f})"
+        print(f" [ok] risk engine: clean→{d_clean.action.value} ({d_clean.score:.1f}), "
+              f"bot→{d_bot.action.value} ({d_bot.score:.1f})")
+
+        # Replay guard
+        g = ReplayGuard(proto.db)
+        n = "nonce-" + cp.sha256(b"x").hex()[:16]
+        assert g.seen_or_record(n) is False
+        assert g.seen_or_record(n) is True
+        print(" [ok] replay guard catches nonce reuse")
+
+        # Site registration + end-to-end /siteverify-front + /siteverify
+        site = proto.sites.register(label="Self-Test", domain="selftest.example")
+        assert site.site_key.startswith("0x4PROOF")
+        ch2 = proto.pow.issue()
+        sol2 = solve(ch2)
+        verdict = proto.evaluate_visitor(
+            site_key=site.site_key, challenge=ch2, solution=sol2,
+            telemetry=clean, requester="selftest.example",
+        )
+        assert verdict["success"], f"clean visitor rejected: {verdict['reasons']}"
+        rt = verdict["response_token"]
+        # Wrong secret → invalid
+        assert proto.consume_response_token(rt, site_key="not-the-key") is None
+        # First consumption succeeds
+        consumed = proto.consume_response_token(rt, site_key=site.site_key)
+        assert consumed and consumed["success"]
+        # Replay — second consumption must fail (one-time token)
+        assert proto.consume_response_token(rt, site_key=site.site_key) is None
+        print(f" [ok] site verification round-trip: action={verdict['action']}, "
+              f"score={verdict['score']:.1f}, response_token one-time")
+
+        # Bot path through the same evaluator must NOT be successful
+        ch3 = proto.pow.issue()
+        sol3 = solve(ch3)
+        bot_verdict = proto.evaluate_visitor(
+            site_key=site.site_key, challenge=ch3, solution=sol3,
+            telemetry=bot, requester="selftest.example",
+        )
+        assert not bot_verdict["success"], \
+            f"bot was accepted (action={bot_verdict['action']}, score={bot_verdict['score']:.1f})"
+        print(f" [ok] bot blocked end-to-end: action={bot_verdict['action']}, "
+              f"score={bot_verdict['score']:.1f}")
 
         print()
         print("All self-tests passed.")

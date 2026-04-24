@@ -6,10 +6,16 @@ requires-python = ">=3.11"
 dependencies = [
     "cryptography>=46.0.7",
     "ecdsa>=0.19.2",
+    "fastapi>=0.136.1",
     "numpy>=2.4.4",
     "pandas>=3.0.2",
     "plotly>=6.7.0",
     "pynacl>=1.6.2",
+    "python-multipart>=0.0.26",
+    "requests>=2.33.1",
+    "scikit-learn>=1.8.0",
     "scipy>=1.17.1",
     "streamlit>=1.56.0",
+    "user-agents>=2.2.0",
+    "uvicorn[standard]>=0.46.0",
 ]

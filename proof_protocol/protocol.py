@@ -27,6 +27,9 @@ from .behavioral_dna import (
 )
 from .database import Database
 from .pedersen import Commitment, commit, verify_opening
+from .proof_of_work import PowChallenge, PowSolution, ProofOfWorkIssuer
+from .replay_protection import ReplayGuard
+from .risk_engine import Action, RiskDecision, evaluate as risk_evaluate
 from .schnorr_zkp import (
     CommitmentZKProof,
     SchnorrSig,
@@ -34,6 +37,8 @@ from .schnorr_zkp import (
     schnorr_verify,
 )
 from .secure_enclave import SecureEnclave, derive_device_id
+from .sites import Site, SiteRegistry
+from .telemetry import TelemetrySummary
 from .trust_tiers import POLICIES, Tier, TierPolicy, can_issue, policy_for
 from .validator_network import QuorumResult, ValidatorNetwork
 
@@ -146,7 +151,13 @@ class ProofProtocol:
         self._dir = data_dir
         self.db = Database(data_dir / "proof.sqlite")
         self.network = ValidatorNetwork(self.db)
+        self.sites = SiteRegistry(self.db)
+        self.pow = ProofOfWorkIssuer()
+        self.replay = ReplayGuard(self.db)
         self._enclaves: dict[str, SecureEnclave] = {}
+        # In-memory short-lived response tokens (response → verdict).
+        # In production this would be Redis with a ~5 minute TTL.
+        self._response_tokens: dict[str, dict[str, Any]] = {}
 
     # --- enclave management ------------------------------------------------- #
 
@@ -384,10 +395,100 @@ class ProofProtocol:
         self.db.link_premium(device_id, aadhaar_hash, upi_handle, digilocker_id)
         self.db.log("device", "link_premium", {"device_id": device_id})
 
+    # --- public-API path: evaluate a visiting browser ---------------------- #
+
+    def evaluate_visitor(
+        self,
+        site_key: str,
+        challenge: PowChallenge,
+        solution: PowSolution,
+        telemetry: TelemetrySummary,
+        requester: str,
+    ) -> dict[str, Any]:
+        """End-to-end /siteverify-front: PoW + replay + telemetry → decision."""
+        site = self.sites.get(site_key)
+        if not site or not site.active:
+            return {
+                "success": False, "action": "BLOCK", "score": 100.0,
+                "reasons": ["invalid sitekey"], "response_token": "",
+            }
+
+        replay_seen = self.replay.seen_or_record(challenge.challenge_id)
+
+        ok_pow, pow_reason = self.pow.verify(challenge, solution)
+        if not ok_pow:
+            telemetry.risk_flags.append(f"PoW: {pow_reason}")
+
+        # Reputation lookup by browser fingerprint (independent of any
+        # device-bound enrollment — see device_id below for premium flows).
+        rep_row = self.db.get_reputation(telemetry.fingerprint)
+        rep_score = float(rep_row["score"]) if rep_row else 100.0
+
+        try:
+            min_action = Action(site.min_action)
+        except ValueError:
+            min_action = Action.ALLOW
+
+        decision: RiskDecision = risk_evaluate(
+            telemetry=telemetry,
+            pow_solved=ok_pow,
+            pow_elapsed_ms=solution.elapsed_seconds * 1000.0,
+            behavioral_distance=None,
+            reputation_score=rep_score,
+            replay_seen_before=replay_seen,
+            relying_party_min_action=min_action,
+        )
+
+        success = decision.action in (Action.ALLOW, Action.ALLOW_WITH_INTERACTION)
+        self.sites.record_request(site.site_key, blocked=not success)
+        # Maintain a fingerprint-keyed reputation that drifts with verdicts.
+        self.db.adjust_reputation(
+            telemetry.fingerprint,
+            delta=(+0.5 if success else -3.0),
+            abuse=(decision.action == Action.BLOCK),
+            success=success,
+        )
+        self.db.log("api", "siteverify_front", {
+            "site": site.site_key, "fingerprint": telemetry.fingerprint,
+            "action": decision.action.value, "score": decision.score,
+        })
+
+        response_token = "RT_" + secrets.token_urlsafe(24).replace("-", "A").replace("_", "B")
+        verdict = {
+            "success": success,
+            "action": decision.action.value,
+            "score": decision.score,
+            "reasons": decision.reasons,
+            "fingerprint": telemetry.fingerprint,
+            "ts": time.time(),
+            "site_key": site.site_key,
+            "components": decision.components,
+        }
+        # Store with a 5-minute lifetime — any longer is risky for a bearer token.
+        self._response_tokens[response_token] = {**verdict, "expires_at": time.time() + 300}
+
+        return {**verdict, "response_token": response_token}
+
+    def consume_response_token(self, response_token: str, site_key: str) -> dict[str, Any] | None:
+        v = self._response_tokens.get(response_token)
+        if v is None:
+            return None
+        # Validate before consuming so a wrong-secret call cannot burn another
+        # site's token.
+        if v.get("site_key") != site_key:
+            return None
+        if v.get("expires_at", 0) < time.time():
+            self._response_tokens.pop(response_token, None)
+            return None
+        # All checks pass — consume.
+        return self._response_tokens.pop(response_token, None)
+
     # --- introspection ------------------------------------------------------ #
 
     def stats(self) -> dict:
-        return self.db.stats()
+        s = self.db.stats()
+        s["sites"] = len(self.sites.list())
+        return s
 
     def all_tier_policies(self) -> list[TierPolicy]:
         return [POLICIES[t] for t in (Tier.BASIC, Tier.STANDARD, Tier.PREMIUM)]

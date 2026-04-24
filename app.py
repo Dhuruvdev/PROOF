@@ -26,6 +26,8 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 
+import os
+
 from proof_protocol.behavioral_dna import (
     FEATURE_NAMES,
     MATCH_THRESHOLD,
@@ -33,7 +35,22 @@ from proof_protocol.behavioral_dna import (
     extract_features,
 )
 from proof_protocol.protocol import ProofProtocol, ProofToken, Tier
+from proof_protocol.risk_engine import Action
 from proof_protocol.trust_tiers import POLICIES
+
+
+def _api_base() -> str:
+    """The public URL where the FastAPI server is reachable."""
+    explicit = os.environ.get("PROOF_API_BASE")
+    if explicit:
+        return explicit.rstrip("/")
+    domain = os.environ.get("REPLIT_DEV_DOMAIN")
+    if domain:
+        # FastAPI runs on a separate port; on Replit only port 5000 is proxied
+        # via the dev domain, so direct external access to 8000 isn't possible
+        # without explicit configuration. The user can override via env var.
+        return f"http://localhost:8000"
+    return "http://localhost:8000"
 
 
 # --------------------------------------------------------------------------- #
@@ -530,6 +547,208 @@ def page_admin(proto: ProofProtocol) -> None:
                     st.error(str(exc))
 
 
+def page_sites(proto: ProofProtocol) -> None:
+    st.title("7.  Site keys (relying parties)")
+    st.caption(
+        "Register a website that wants to drop the PROOF widget on its login "
+        "page. You receive a public **site key** (embedded in the widget) and a "
+        "private **secret key** (used by your backend to verify tokens via "
+        "/api/siteverify)."
+    )
+
+    with st.form("register_site", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        label = c1.text_input("Label", value="My Site")
+        domain = c2.text_input("Domain", value="example.com")
+        min_action = st.selectbox(
+            "Minimum required action",
+            [a.value for a in Action], index=0,
+            help="The strictest action this site will accept. ALLOW = even "
+                 "fast-path verifications are accepted; CHALLENGE = require "
+                 "an interactive challenge for every visitor.",
+        )
+        if st.form_submit_button("Register site", type="primary"):
+            site = proto.sites.register(label=label, domain=domain, min_action=min_action)
+            st.success(f"Registered **{site.label}** at `{site.domain}`")
+            st.markdown("**Site key** (public, embedded in widget JS):")
+            st.code(site.site_key, language="text")
+            st.markdown("**Secret key** (private, save this now — it is not shown again):")
+            st.code(site.secret_key, language="text")
+
+    st.divider()
+    st.subheader("Registered sites")
+    sites = proto.sites.list()
+    if not sites:
+        st.info("No sites registered yet.")
+        return
+    rows = []
+    for s in sites:
+        rate = (100.0 * s.blocks / s.requests) if s.requests else 0.0
+        rows.append({
+            "label": s.label, "domain": s.domain,
+            "site_key": s.site_key,
+            "min_action": s.min_action,
+            "active": s.active,
+            "requests": s.requests,
+            "blocks": s.blocks,
+            "block_rate": f"{rate:.1f}%",
+            "created": _ts(s.created_at),
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+
+def page_integration(proto: ProofProtocol) -> None:
+    st.title("8.  Integration — drop in 4 lines")
+    sites = proto.sites.list()
+    if not sites:
+        st.info("Register a site first (page 7).")
+        return
+    site = next((s for s in sites if (
+        st.selectbox("Site", [s.label + "  ·  " + s.site_key[:14] + "…" for s in sites], key="int_site")
+        .startswith(s.label + "  ·  " + s.site_key[:14])
+    )), sites[0])
+
+    api = _api_base()
+
+    st.subheader("Frontend (HTML)")
+    st.caption("Drop these two tags anywhere in your page. The widget renders a "
+               "Cloudflare-style 'Verify you are human' checkbox.")
+    st.code(
+        f'''<script src="{api}/api/widget.js" async defer></script>
+<div id="proof-widget"></div>
+<script>
+  PROOF.render("proof-widget", {{
+    sitekey: "{site.site_key}",
+    callback: function(token) {{
+      document.getElementById("proof-token").value = token;
+    }}
+  }});
+</script>
+<input type="hidden" id="proof-token" name="proof-response" />''',
+        language="html",
+    )
+
+    st.subheader("Backend verification (Python · requests)")
+    st.code(
+        f'''import requests
+r = requests.post(
+    "{api}/api/siteverify",
+    data={{
+        "secret":   "<your secret key — keep this server-side>",
+        "response": request.form["proof-response"],
+        "remoteip": request.remote_addr,
+    }},
+).json()
+if r["success"]:
+    print("Verified human · score", r["score"], "· action", r["action"])
+else:
+    abort(403, "Bot or low confidence: " + ",".join(r["error-codes"]))''',
+        language="python",
+    )
+
+    st.subheader("Backend verification (curl, for any stack)")
+    st.code(
+        f'''curl -X POST {api}/api/siteverify \\
+  -d secret=<YOUR_SECRET_KEY> \\
+  -d response=<TOKEN_FROM_WIDGET>''',
+        language="bash",
+    )
+
+
+def page_live_widget(proto: ProofProtocol) -> None:
+    st.title("9.  Live widget demo")
+    st.caption(
+        "The widget shown below is the same JS bundle every relying party "
+        "embeds. It collects browser telemetry, solves a silent proof-of-work, "
+        "and submits to the public API. **This is the real widget, not a mock.**"
+    )
+
+    sites = proto.sites.list()
+    if not sites:
+        st.warning("Register a site first (page 7) to obtain a sitekey.")
+        return
+    sitekey = st.selectbox(
+        "Use sitekey", [s.site_key for s in sites],
+        format_func=lambda k: next(s.label for s in sites if s.site_key == k) + "  ·  " + k[:18] + "…",
+    )
+
+    api = _api_base()
+    st.caption(f"API base: `{api}`")
+
+    components.html(
+        f"""
+        <script src="{api}/api/widget.js" async defer></script>
+        <div id="proof-demo" style="margin: 10px 0;"></div>
+        <pre id="proof-out" style="background:#0b1020;color:#9ce39c;padding:10px;
+             border-radius:6px;font-size:12px;max-height:240px;overflow:auto;"></pre>
+        <script>
+          function tryRender() {{
+            if (!window.PROOF) {{ setTimeout(tryRender, 100); return; }}
+            window.PROOF.render("proof-demo", {{
+              sitekey: "{sitekey}",
+              callback: function(token) {{
+                document.getElementById("proof-out").innerText =
+                  "response_token = " + token + "\\n\\n" +
+                  "Now your backend would POST {{secret, response}} to /api/siteverify";
+              }}
+            }});
+          }}
+          tryRender();
+        </script>
+        """,
+        height=320,
+    )
+
+    st.divider()
+    st.subheader("Or test the API directly from this page")
+    st.write("Useful when the iframe widget cannot reach the API server "
+             "(e.g. when running locally without the FastAPI workflow up).")
+
+    if st.button("Run a synthetic /siteverify-front call"):
+        from proof_protocol.proof_of_work import solve
+        from proof_protocol.telemetry import analyze
+        with st.spinner("Issuing PoW challenge, solving, and evaluating telemetry…"):
+            ch = proto.pow.issue()
+            sol = solve(ch)
+            tele = analyze({
+                "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                             "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+                "platform": "Linux x86_64",
+                "languages": ["en-US", "en"], "languagesCount": 2,
+                "pluginsCount": 5, "hardwareConcurrency": 8, "deviceMemory": 8,
+                "screenWidth": 1920, "screenHeight": 1080, "colorDepth": 24,
+                "pixelRatio": 2, "touchSupport": False,
+                "timezone": "Asia/Kolkata", "timezoneOffsetMinutes": 330,
+                "webdriver": False, "chromeRuntime": True,
+                "automationProps": [],
+                "canvasHash": "abc123" * 12,
+                "webglRenderer": "Apple M2", "webglVendor": "Apple",
+                "audioHash": "35.7449712753",
+                "fontsDetected": 24, "rtcLocalIp": "192.168.1.27",
+                "pointerIntervalsMs": [12.4, 14.1, 9.8, 22.3, 18.7, 15.2, 11.8, 19.0],
+                "scrollCount": 4, "focusEvents": 1,
+                "challengeSolveMs": int(sol.elapsed_seconds * 1000),
+                "requestAgeSeconds": 0.6,
+                "batteryPresent": True, "connectionRttMs": 50,
+            })
+            verdict = proto.evaluate_visitor(
+                site_key=sitekey, challenge=ch, solution=sol,
+                telemetry=tele, requester="streamlit-demo",
+            )
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Action", verdict["action"])
+        c2.metric("Risk score", f"{verdict['score']:.1f}")
+        c3.metric("Success", "✓" if verdict["success"] else "✗")
+        st.markdown("**Component scores**")
+        st.json(verdict["components"])
+        st.markdown("**Risk reasons**")
+        for r in verdict["reasons"][:8]:
+            st.write("• " + r)
+        st.markdown("**Browser fingerprint**")
+        st.code(verdict["fingerprint"])
+        st.caption("response_token (one-time, 5 min TTL): " + verdict["response_token"])
+
+
 def page_audit(proto: ProofProtocol) -> None:
     st.title("6.  Audit log & verification history")
 
@@ -628,6 +847,9 @@ def main() -> None:
                 "4. Validator network",
                 "5. Admin",
                 "6. Audit log",
+                "7. Sites",
+                "8. Integration",
+                "9. Live widget",
             ],
         )
         st.divider()
@@ -642,6 +864,9 @@ def main() -> None:
         "4. Validator network": page_network,
         "5. Admin": page_admin,
         "6. Audit log": page_audit,
+        "7. Sites": page_sites,
+        "8. Integration": page_integration,
+        "9. Live widget": page_live_widget,
     }
     pages[page](proto)
 
