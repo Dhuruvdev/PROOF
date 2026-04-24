@@ -8,19 +8,40 @@ hCaptcha and reCAPTCHA v3 — every component is real, no mockups.
 ## What's running
 
 * **PROOF Widget / Public HTTP API** — workflow `Start application`, port 5000.
-  FastAPI + uvicorn. Cloudflare-compatible endpoints any external site can
-  integrate with, plus a built-in interstitial demo:
-  - `GET  /`                       — demo home with "Open" button
-  - `GET  /verify`                 — Cloudflare-style verification interstitial
-  - `GET  /protected`              — page behind the interstitial
-  - `GET  /api/health`
-  - `GET  /api/widget.js`          — drop-in JS bundle
+  FastAPI + uvicorn. The only UI surface is the verification interstitial at
+  `/`; all other routes are JSON / JS API endpoints:
+  - `GET  /`                       — Cloudflare-style verification interstitial
+                                     (the only HTML page; success/failure are
+                                     revealed inline on the same page)
+  - `GET  /api/health`             — liveness probe
+  - `GET  /api/widget.js`          — drop-in JS bundle (Turnstile-shaped API)
   - `GET  /api/challenge?sitekey=` — issue PoW challenge
-  - `POST /api/siteverify-front`   — browser → PROOF Network
+  - `POST /api/siteverify-front`   — browser → PROOF Network (PoW + telemetry → verdict)
   - `POST /api/siteverify`         — site backend → PROOF Network (Turnstile-shaped body)
+  - `GET  /favicon.ico`            — empty 204 (silence browser noise)
 
-The previous Streamlit admin UI has been removed; the project now ships only
-the widget + public API surface.
+Every signal is real — no mocks. The interstitial pipeline runs:
+
+1. Real SHA-256 proof-of-work, adaptive 8–26 bit difficulty, HMAC-bound to
+   the issuing server (cannot be downgraded by the client)
+2. Real 27-feature browser-environment telemetry: canvas / WebGL / audio
+   fingerprint, font enumeration, automation-surface probes (webdriver,
+   _phantom, $cdc_*, playwright, puppeteer…), WebRTC local-IP probe,
+   pointer-jitter intervals
+3. Real IsolationForest anomaly model (trained at startup on a 600-sample
+   synthetic human population) + weighted rule ensemble → Cloudflare
+   four-path verdict (`ALLOW / ALLOW_WITH_INTERACTION / CHALLENGE / BLOCK`)
+4. Real one-time response token (5 min TTL, single-consume, site-scoped)
+
+Hardening on every response:
+- Strict CSP (`default-src 'self'`, `frame-ancestors 'none'`)
+- `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`
+- `Referrer-Policy: strict-origin-when-cross-origin`
+- `Permissions-Policy` denies camera / mic / geolocation / payment
+- `/` is `Cache-Control: no-store` so each load mints a fresh Ray ID + challenge
+
+The previous Streamlit admin UI and the `/protected` demo page have been
+removed; the project now ships only the interstitial + public API surface.
 
 ## Stack
 

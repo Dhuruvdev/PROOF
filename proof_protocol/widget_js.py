@@ -250,7 +250,13 @@ _WIDGET_JS = r"""
       method: "POST", headers: {"Content-Type":"application/json"},
       body: JSON.stringify(submission)
     });
-    return res.json();
+    const out = await res.json();
+    // Attach client-observed metadata so callers can show real timing /
+    // difficulty without re-issuing a separate challenge.
+    out.pow_difficulty = challenge.difficulty | 0;
+    out.pow_solve_ms = T.challengeSolveMs;
+    out.client_ts = Date.now() / 1000;
+    return out;
   }
 
   // ---------- Public render API (Turnstile-compatible signature) ---------- //
