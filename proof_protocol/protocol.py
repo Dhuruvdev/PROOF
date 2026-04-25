@@ -10,11 +10,14 @@ needs.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from . import crypto_primitives as cp
@@ -156,8 +159,32 @@ class ProofProtocol:
         self.replay = ReplayGuard(self.db)
         self._enclaves: dict[str, SecureEnclave] = {}
         # In-memory short-lived response tokens (response → verdict).
-        # In production this would be Redis with a ~5 minute TTL.
-        self._response_tokens: dict[str, dict[str, Any]] = {}
+        # In production this would be Redis with a ~5 minute TTL. Bounded LRU
+        # so a sustained flood of successful verifications cannot exhaust
+        # memory; the oldest entries are evicted first.
+        self._response_tokens: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        self._response_tokens_lock = Lock()
+        self._response_token_evictions = 0
+        # Process-local pepper for fingerprint hashing in audit logs. Privacy:
+        # the audit log records SHA-256(pepper||fingerprint)[:16] instead of
+        # the raw browser fingerprint, so a leaked log row cannot be
+        # correlated against a raw fingerprint table.
+        self._fp_log_pepper = secrets.token_bytes(32)
+
+    _RT_MAX = 4096
+
+    def _store_response_token(self, token: str, payload: dict[str, Any]) -> None:
+        with self._response_tokens_lock:
+            self._response_tokens[token] = payload
+            self._response_tokens.move_to_end(token)
+            while len(self._response_tokens) > self._RT_MAX:
+                self._response_tokens.popitem(last=False)
+                self._response_token_evictions += 1
+
+    def _hash_fp_for_log(self, fingerprint: str) -> str:
+        return hashlib.sha256(
+            self._fp_log_pepper + b"::" + fingerprint.encode("utf-8")
+        ).hexdigest()[:16]
 
     # --- enclave management ------------------------------------------------- #
 
@@ -403,9 +430,15 @@ class ProofProtocol:
         challenge: PowChallenge,
         solution: PowSolution,
         telemetry: TelemetrySummary,
+        telemetry_hash: str,
         requester: str,
     ) -> dict[str, Any]:
-        """End-to-end /siteverify-front: PoW + replay + telemetry → decision."""
+        """End-to-end /siteverify-front: PoW + replay + telemetry → decision.
+
+        ``telemetry_hash`` is the SHA-256 of the verbatim telemetry JSON the
+        client posted; it is used to verify the proof-of-work was solved
+        against the same telemetry the client is now submitting.
+        """
         site = self.sites.get(site_key)
         if not site or not site.active:
             return {
@@ -415,7 +448,9 @@ class ProofProtocol:
 
         replay_seen = self.replay.seen_or_record(challenge.challenge_id)
 
-        ok_pow, pow_reason = self.pow.verify(challenge, solution)
+        ok_pow, pow_reason = self.pow.verify(
+            challenge, solution, sitekey=site_key, telemetry_hash=telemetry_hash,
+        )
         if not ok_pow:
             telemetry.risk_flags.append(f"PoW: {pow_reason}")
 
@@ -449,9 +484,13 @@ class ProofProtocol:
             abuse=(decision.action == Action.BLOCK),
             success=success,
         )
+        # Audit log records a salted hash of the fingerprint, never the raw
+        # value, so a leaked log row can't be correlated with another DB.
         self.db.log("api", "siteverify_front", {
-            "site": site.site_key, "fingerprint": telemetry.fingerprint,
-            "action": decision.action.value, "score": decision.score,
+            "site": site.site_key,
+            "fp_hash": self._hash_fp_for_log(telemetry.fingerprint),
+            "action": decision.action.value,
+            "score": round(decision.score, 2),
         })
 
         response_token = "RT_" + secrets.token_urlsafe(24).replace("-", "A").replace("_", "B")
@@ -466,23 +505,27 @@ class ProofProtocol:
             "components": decision.components,
         }
         # Store with a 5-minute lifetime — any longer is risky for a bearer token.
-        self._response_tokens[response_token] = {**verdict, "expires_at": time.time() + 300}
+        self._store_response_token(
+            response_token,
+            {**verdict, "expires_at": time.time() + 300},
+        )
 
         return {**verdict, "response_token": response_token}
 
     def consume_response_token(self, response_token: str, site_key: str) -> dict[str, Any] | None:
-        v = self._response_tokens.get(response_token)
-        if v is None:
-            return None
-        # Validate before consuming so a wrong-secret call cannot burn another
-        # site's token.
-        if v.get("site_key") != site_key:
-            return None
-        if v.get("expires_at", 0) < time.time():
-            self._response_tokens.pop(response_token, None)
-            return None
-        # All checks pass — consume.
-        return self._response_tokens.pop(response_token, None)
+        with self._response_tokens_lock:
+            v = self._response_tokens.get(response_token)
+            if v is None:
+                return None
+            # Validate before consuming so a wrong-secret call cannot burn
+            # another site's token.
+            if v.get("site_key") != site_key:
+                return None
+            if v.get("expires_at", 0) < time.time():
+                self._response_tokens.pop(response_token, None)
+                return None
+            # All checks pass — consume atomically.
+            return self._response_tokens.pop(response_token, None)
 
     # --- introspection ------------------------------------------------------ #
 

@@ -19,8 +19,8 @@ GET  /api/challenge?sitekey=...
         Issue a fresh PoW challenge bound to the site.
 POST /api/siteverify-front
         Browser → PROOF Network: submits {sitekey, challenge, solution,
-        telemetry}; receives a one-time *response_token* the relying-party
-        backend then verifies via /api/siteverify.
+        telemetry_raw, telemetry_hash}; receives a one-time *response_token*
+        the relying-party backend then verifies via /api/siteverify.
 POST /api/siteverify
         Site backend → PROOF Network: {secret, response} → {success,
         action, score, hostname, ts, reasons[]}. Cloudflare-compatible
@@ -33,30 +33,81 @@ import hashlib
 import hmac
 import html
 import json
+import os
 import secrets
 import time
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
+from .abuse_guard import (
+    AbuseGuard,
+    PayloadTooLarge,
+    RateRule,
+    bounded_json_body,
+    payload_too_large_response,
+)
 from .proof_of_work import PowChallenge, PowSolution
 from .protocol import ProofProtocol
-from .risk_engine import Action
 from .telemetry import analyze
 from .widget_js import widget_javascript
 
 
+API_VERSION = "1.1.0"
+
+# Hard cap on the JSON body of /api/siteverify-front. The largest legitimate
+# submission (telemetry + ~800 pointer intervals + audio/canvas/webgl strings)
+# fits comfortably under 16 KB. 32 KB gives plenty of headroom while still
+# refusing the "send 100 MB to OOM the server" attack.
+_SITEVERIFY_FRONT_MAX_BODY = 32 * 1024
+
 # --------------------------------------------------------------------------- #
 # Proof ID — every page load mints a fresh, HMAC-signed identifier so support
 # / abuse-team requests can be traced back and verified as authentic. The MAC
-# is keyed by a random 32-byte secret generated at process start, so an
-# attacker cannot forge a Proof ID that this server will accept.
+# key is loaded from disk (mode 0600) so Proof IDs survive process restarts
+# and remain valid across replicas — same secret on every node verifies the
+# same set of IDs. The directory is created if missing; on first boot a fresh
+# 32-byte key is written.
 # --------------------------------------------------------------------------- #
 
-_PROOF_ID_KEY: bytes = secrets.token_bytes(32)
 _PROOF_ID_PREFIX = "PROOF"
+_PROOF_ID_KEY: bytes = b""  # populated by build_app() before any request
+
+
+def _load_or_create_proof_id_secret(data_dir: Path) -> bytes:
+    """Return a 32-byte HMAC key, persisted to ``data_dir/proof_id.key``.
+
+    File is mode 0600. Falls back to a process-local key only if the disk is
+    unwritable — at which point we still get correctness within one process,
+    just no cross-restart continuity.
+    """
+    data_dir.mkdir(parents=True, exist_ok=True)
+    key_path = data_dir / "proof_id.key"
+    if key_path.exists():
+        try:
+            data = key_path.read_bytes()
+            if len(data) >= 32:
+                return data[:32]
+        except OSError:
+            pass
+    key = secrets.token_bytes(32)
+    try:
+        # Atomic write via tempfile + rename so a crash mid-write can't leave
+        # an empty file that future boots would treat as the canonical key.
+        tmp = key_path.with_suffix(".key.tmp")
+        with open(tmp, "wb") as f:
+            f.write(key)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, key_path)
+    except OSError:
+        pass
+    return key
 
 
 def _mint_proof_id() -> tuple[str, int]:
@@ -232,7 +283,7 @@ _INTERSTITIAL_HTML = r"""<!DOCTYPE html>
        <a href="/privacy">Privacy</a></div>
 </div>
 
-<script src="/api/widget.js"></script>
+<script src="/api/widget.js?v=__WIDGET_VER__"></script>
 <script>
 (function() {
   "use strict";
@@ -319,9 +370,6 @@ _INTERSTITIAL_HTML = r"""<!DOCTYPE html>
     if (!window.PROOF || !window.PROOF.verify) {
       throw new Error("PROOF widget failed to load");
     }
-    // Single full-pipeline call: real PoW + real telemetry + real risk
-    // engine. The widget attaches pow_difficulty / pow_solve_ms / client_ts
-    // to the returned object.
     var r = await window.PROOF.verify(SITEKEY);
     powDifficulty = (r && r.pow_difficulty) | 0;
     r._solveMs = (r && r.pow_solve_ms) || null;
@@ -331,10 +379,8 @@ _INTERSTITIAL_HTML = r"""<!DOCTYPE html>
 
   async function start() {
     if (!window.PROOF || !window.PROOF.verify) {
-      // The script tag may still be loading.
       return setTimeout(start, 50);
     }
-    // Reset UI state for retries.
     $("retry").style.display = "none";
     $("verified-box").style.display = "none";
     $("reasons").style.display = "none";
@@ -372,10 +418,7 @@ def _render(template: str, **subs: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Privacy page — real, substantive disclosure of what the verifier collects,
-# why, how long it is kept, and how to verify a Proof ID. No tracking, no
-# external scripts, no third-party fonts — same strict CSP as the
-# interstitial.
+# Privacy page
 # --------------------------------------------------------------------------- #
 _PRIVACY_HTML = r"""<!doctype html>
 <html lang="en"><head>
@@ -461,13 +504,18 @@ _PRIVACY_HTML = r"""<!doctype html>
 
   <h2>2. What the server stores</h2>
   <ul>
-    <li>A salted, irreversible hash of the browser fingerprint, used to track
-        retry-rate per fingerprint. Plain telemetry values are not stored.</li>
+    <li>An audit log entry per verification containing only a
+        <em>process-peppered</em> SHA-256 of the browser fingerprint
+        (16 hex chars). The raw fingerprint is never written to disk and a
+        leaked log row cannot be correlated against any other database.</li>
     <li>Per-site counters: total challenges issued, blocked-vs-allowed counts.
         These are never tied to an individual visitor.</li>
-    <li>Each issued Proof ID is HMAC-signed with a process-local 32-byte key
-        and embedded in the page; nothing about the visitor is stored
-        alongside it.</li>
+    <li>Each issued Proof ID is HMAC-signed with a 32-byte server key persisted
+        to <code>data/proof_id.key</code> (file mode 0600), so Proof IDs survive
+        process restarts and remain verifiable across replicas. The key file
+        contains no visitor data.</li>
+    <li>No cookies, no <code>localStorage</code>, no
+        <code>sessionStorage</code>, no third-party requests.</li>
   </ul>
 
   <h2>3. Cookies &amp; cross-site tracking</h2>
@@ -482,11 +530,25 @@ _PRIVACY_HTML = r"""<!doctype html>
   <h2>4. Proof of Work</h2>
   <p>
     The browser is asked to find a 64-bit nonce such that
-    <code>SHA-256(challenge_id || nonce)</code> has at least
-    <em>n</em> leading zero bits. This is the same Hashcash primitive that
-    powers Bitcoin block headers — genuinely unforgeable, requires no shared
-    secret, and forces every solver to spend measurable CPU time. Difficulty
-    is signed by the issuer key so a client cannot lower it unilaterally.
+    <code>SHA-256(challenge_id || sitekey || telemetry_hash || nonce)</code>
+    has at least <em>n</em> leading zero bits — same Hashcash primitive that
+    powers Bitcoin block headers, but with three extra inputs bound into the
+    hashed message:
+  </p>
+  <ul>
+    <li><code>sitekey</code> — a solution computed for one site cannot be
+        replayed against another.</li>
+    <li><code>telemetry_hash</code> — the browser commits to its telemetry
+        <em>before</em> spending CPU on the proof. Substituting a different
+        telemetry blob at submission time invalidates the proof.</li>
+    <li>The challenge MAC includes the sitekey, signed by the issuer key, so a
+        client cannot lower difficulty or transplant a challenge.</li>
+  </ul>
+  <p>
+    Default difficulty is 14 leading zero bits, scaling up to 20 bits under
+    elevated risk. This is invisible to a human (~50–250 ms in V8/SpiderMonkey)
+    but caps a single CPU at ~5 verifications per second — a meaningful tax on
+    bot farms operating at scale.
   </p>
 
   <h2 id="proof-id">5. What is a Proof ID?</h2>
@@ -497,10 +559,11 @@ _PRIVACY_HTML = r"""<!doctype html>
   <pre>PROOF-&lt;16 hex random&gt;-&lt;10 hex epoch&gt;-&lt;8 hex HMAC tag&gt;</pre>
   <p>
     The trailing 8-hex tag is an <code>HMAC-SHA256</code> over the random and
-    timestamp portions, keyed by a 32-byte secret that exists only inside this
-    server process. That means an attacker cannot forge a Proof ID that this
-    server will accept, and you can independently confirm that a Proof ID
-    quoted to you really came from this site:
+    timestamp portions, keyed by a 32-byte secret persisted to
+    <code>data/proof_id.key</code> (file mode 0600). That means an attacker
+    cannot forge a Proof ID that this server will accept, the ID remains
+    valid across server restarts, and you can independently confirm that a
+    Proof ID quoted to you really came from this site:
   </p>
   <h3 id="verify-form">Verify a Proof ID</h3>
   <form id="verify-form" onsubmit="return false;">
@@ -580,7 +643,10 @@ _DEMO_SITE_DOMAIN = "demo.proof.local"
 
 
 def build_app(protocol: ProofProtocol) -> FastAPI:
-    app = FastAPI(title="PROOF Network — Public API", version="1.0.0")
+    global _PROOF_ID_KEY
+    _PROOF_ID_KEY = _load_or_create_proof_id_secret(protocol._dir)
+
+    app = FastAPI(title="PROOF Network — Public API", version=API_VERSION)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -589,12 +655,22 @@ def build_app(protocol: ProofProtocol) -> FastAPI:
         allow_credentials=False,
     )
 
+    # ---- Anti-abuse middleware ------------------------------------------- #
+    # Per-IP token-bucket rate limits + body-size cap. Numbers are tuned for
+    # the legitimate interstitial flow (1 challenge + 1 verify per page load)
+    # while still throttling a single host hammering challenges.
+    guard = AbuseGuard()
+    guard.add("/api/challenge",       ("GET",),  RateRule.per_minute(60))
+    guard.add("/api/siteverify-front", ("POST",), RateRule.per_minute(60),
+              max_body_bytes=_SITEVERIFY_FRONT_MAX_BODY)
+    guard.add("/api/siteverify",      ("POST",), RateRule.per_minute(120))
+    guard.add("/api/proof-id/verify", ("GET",),  RateRule.per_minute(120))
+    guard.add("/",                    ("GET",),  RateRule.per_minute(120))
+    app.middleware("http")(guard)
+
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
         response = await call_next(request)
-        # Conservative defaults — the only HTML surface is the interstitial,
-        # which loads exactly one same-origin script (/api/widget.js) and uses
-        # an inline bootstrap. All other endpoints return JSON / JS.
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
@@ -602,7 +678,6 @@ def build_app(protocol: ProofProtocol) -> FastAPI:
             "Permissions-Policy",
             "camera=(), microphone=(), geolocation=(), payment=()",
         )
-        # Allow inline bootstrap and same-origin /api/widget.js.
         response.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'self'; "
@@ -619,16 +694,23 @@ def build_app(protocol: ProofProtocol) -> FastAPI:
     def _demo_site():
         """Return (or lazily create) the site used by the built-in interstitial.
 
-        Keeps the demo self-contained so a fresh deployment renders correctly
-        without any out-of-band registration step.
+        The demo site must accept any Origin (the deployment is reached via
+        many hosts: Replit dev URL, .replit.app, custom domains, localhost
+        previews, etc.). We migrate any pre-existing demo site whose
+        allowed_origins is empty up to ``["*"]`` so older deployments
+        continue to work after this hardening pass.
         """
         for s in protocol.sites.list():
             if s.label == _DEMO_SITE_LABEL:
+                if s.allowed_origins != ["*"]:
+                    protocol.sites.set_allowed_origins(s.site_key, ["*"])
+                    s.allowed_origins = ["*"]
                 return s
         return protocol.sites.register(
             label=_DEMO_SITE_LABEL,
             domain=_DEMO_SITE_DOMAIN,
             min_action="ALLOW",
+            allowed_origins=["*"],
         )
 
     def _hostname_from_request(request: Request) -> str:
@@ -637,18 +719,15 @@ def build_app(protocol: ProofProtocol) -> FastAPI:
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
-        return {"ok": True, "stats": protocol.stats(), "ts": time.time()}
+        return {"ok": True, "version": API_VERSION,
+                "stats": protocol.stats(), "ts": time.time()}
 
     @app.get("/favicon.ico")
     def favicon() -> Response:
-        # Serve an empty 204 so browsers stop logging 404s.
         return Response(status_code=204)
 
     @app.head("/")
     def interstitial_head() -> Response:
-        # Reverse proxies (incl. the Replit dev proxy) probe with HEAD;
-        # returning 405 here marks the upstream unhealthy and the proxy
-        # then 502s every real GET. A bare 200 keeps the proxy happy.
         return Response(
             status_code=200,
             headers={"Cache-Control": "no-store"},
@@ -669,8 +748,8 @@ def build_app(protocol: ProofProtocol) -> FastAPI:
             PROOF_ID=html.escape(proof_id),
             SITEKEY_JSON=json.dumps(site.site_key),
             PROOF_ID_JSON=json.dumps(proof_id),
+            WIDGET_VER=_widget_etag.strip('"'),
         )
-        # Don't cache — every load should mint a fresh Proof ID + challenge.
         return HTMLResponse(
             body,
             headers={
@@ -688,82 +767,131 @@ def build_app(protocol: ProofProtocol) -> FastAPI:
 
     @app.get("/api/proof-id/verify")
     def proof_id_verify(id: str = Query(..., min_length=10, max_length=128)) -> dict[str, Any]:
-        """Public endpoint: confirm a Proof ID was minted by this server.
-
-        The Proof ID is HMAC-signed with a process-local 32-byte secret, so
-        only this server can mint accepted IDs. This is a real verification
-        — not a lookup of stored state — and is safe to expose publicly.
-        """
         return _verify_proof_id(id)
+
+    # Widget content is cached at build time so reloads stay cheap, but the
+    # ETag is the SHA-256 of the bundle so any code change invalidates every
+    # cached copy on the next conditional request.
+    _widget_js_body = widget_javascript("")
+    _widget_etag = '"' + hashlib.sha256(_widget_js_body.encode("utf-8")).hexdigest()[:16] + '"'
 
     @app.get("/api/widget.js", response_class=PlainTextResponse)
     def widget(request: Request) -> Response:
-        # Use a relative API base so the widget always calls its own origin
-        # (works behind reverse proxies, mixed-protocol setups, custom domains).
-        js = widget_javascript("")
+        if request.headers.get("if-none-match") == _widget_etag:
+            return Response(status_code=304, headers={"ETag": _widget_etag})
         return Response(
-            content=js,
+            content=_widget_js_body,
             media_type="application/javascript; charset=utf-8",
-            headers={"Cache-Control": "public, max-age=300"},
+            headers={
+                "Cache-Control": "public, max-age=60, must-revalidate",
+                "ETag": _widget_etag,
+            },
         )
 
     @app.get("/api/challenge")
-    def challenge(sitekey: str = Query(...)) -> dict[str, Any]:
+    def challenge(sitekey: str = Query(..., min_length=8, max_length=256)) -> dict[str, Any]:
         site = protocol.sites.get(sitekey)
         if not site or not site.active:
             raise HTTPException(status_code=400, detail="invalid or inactive sitekey")
-        ch = protocol.pow.issue(risk_score=0.0)
+        # Risk score 0 here — adaptive bump happens server-side once we
+        # observe abusive patterns from this IP (handled by AbuseGuard for now).
+        ch = protocol.pow.issue(sitekey=sitekey, risk_score=0.0)
         return ch.to_dict()
 
     @app.post("/api/siteverify-front")
-    async def siteverify_front(request: Request) -> dict[str, Any]:
+    async def siteverify_front(request: Request) -> Response:
+        # 1. Read body with a strict cap (defense against streaming clients
+        #    that omit Content-Length).
         try:
-            body = await request.json()
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=400, detail=f"invalid JSON body: {exc}")
+            raw = await bounded_json_body(request, _SITEVERIFY_FRONT_MAX_BODY)
+        except PayloadTooLarge as exc:
+            return payload_too_large_response(exc)
+        try:
+            body = json.loads(raw.decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("body must be a JSON object")
+        except (UnicodeDecodeError, ValueError):
+            raise HTTPException(status_code=400, detail="invalid request body")
 
-        sitekey = body.get("sitekey", "")
+        # 2. Sitekey lookup + Origin allowlist.
+        sitekey = str(body.get("sitekey") or "")
         site = protocol.sites.get(sitekey)
         if not site or not site.active:
-            raise HTTPException(status_code=400, detail="invalid or inactive sitekey")
+            raise HTTPException(status_code=400, detail="invalid request")
+        origin = request.headers.get("origin", "") or request.headers.get("referer", "")
+        if origin and not site.origin_allowed(origin):
+            raise HTTPException(status_code=403, detail="origin not allowed for this sitekey")
+
+        # 3. Telemetry must arrive verbatim (so the server can recompute the
+        #    same SHA-256 the client committed to before solving the PoW).
+        telemetry_raw = body.get("telemetry_raw")
+        telemetry_hash_claim = str(body.get("telemetry_hash") or "")
+        if not isinstance(telemetry_raw, str) or len(telemetry_raw) > _SITEVERIFY_FRONT_MAX_BODY:
+            raise HTTPException(status_code=400, detail="invalid request")
+        if len(telemetry_hash_claim) != 64:
+            raise HTTPException(status_code=400, detail="invalid request")
+        recomputed = hashlib.sha256(telemetry_raw.encode("utf-8")).hexdigest()
+        if not hmac.compare_digest(recomputed, telemetry_hash_claim):
+            raise HTTPException(status_code=400, detail="telemetry hash mismatch")
 
         try:
-            challenge = PowChallenge.from_dict(body["challenge"])
-            solution = PowSolution(
-                challenge_id=body["solution"]["challenge_id"],
-                nonce=int(body["solution"]["nonce"]),
-                elapsed_seconds=float(body["solution"]["elapsed_seconds"]),
-            )
-        except (KeyError, ValueError, TypeError) as exc:
-            raise HTTPException(status_code=400, detail=f"malformed submission: {exc}")
+            telemetry_dict = json.loads(telemetry_raw)
+            if not isinstance(telemetry_dict, dict):
+                raise ValueError
+        except (ValueError, json.JSONDecodeError):
+            raise HTTPException(status_code=400, detail="invalid request")
 
-        telemetry_summary = analyze(body.get("telemetry") or {})
+        # Merge any post-PoW live signals (solve time, request age) — these
+        # are deliberately outside the integrity hash because they are
+        # computed only after the PoW finishes.
+        live = body.get("live") or {}
+        if isinstance(live, dict):
+            if "challengeSolveMs" in live:
+                telemetry_dict["challengeSolveMs"] = live["challengeSolveMs"]
+            if "requestAgeSeconds" in live:
+                telemetry_dict["requestAgeSeconds"] = live["requestAgeSeconds"]
+
+        # 4. Parse challenge + solution.
+        try:
+            challenge = PowChallenge.from_dict(body["challenge"])
+            sol_raw = body["solution"]
+            solution = PowSolution(
+                challenge_id=str(sol_raw["challenge_id"]),
+                nonce=int(sol_raw["nonce"]),
+                elapsed_seconds=float(sol_raw["elapsed_seconds"]),
+                telemetry_hash=str(sol_raw.get("telemetry_hash") or telemetry_hash_claim),
+            )
+        except (KeyError, ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="invalid request")
+
+        # 5. Risk evaluation (PoW + telemetry + replay + reputation).
+        telemetry_summary = analyze(telemetry_dict)
         decision = protocol.evaluate_visitor(
             site_key=sitekey,
             challenge=challenge,
             solution=solution,
             telemetry=telemetry_summary,
+            telemetry_hash=telemetry_hash_claim,
             requester=site.domain,
         )
 
-        return {
+        return JSONResponse({
             "success": decision["success"],
             "token": decision.get("response_token", ""),
             "action": decision["action"],
             "score": decision["score"],
             "reasons": decision["reasons"][:6],
             "fingerprint": telemetry_summary.fingerprint,
-        }
+        })
 
     @app.post("/api/siteverify")
     async def siteverify(request: Request) -> dict[str, Any]:
-        # Accept either application/json or form-encoded (Turnstile-compatible).
         ctype = request.headers.get("content-type", "")
         if "application/json" in ctype:
             try:
                 body = await request.json()
-            except Exception as exc:  # noqa: BLE001
-                return {"success": False, "error-codes": [f"invalid-input-body: {exc}"]}
+            except Exception:  # noqa: BLE001
+                return {"success": False, "error-codes": ["invalid-input-body"]}
             secret = str(body.get("secret", ""))
             response = str(body.get("response", ""))
         else:

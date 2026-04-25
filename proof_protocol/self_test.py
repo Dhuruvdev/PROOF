@@ -181,23 +181,35 @@ def main() -> int:
 
         # ----- Phase 2: PoW + telemetry + risk engine + sites ---------------
 
-        # Hashcash: forged challenge MAC must be rejected
+        # Hashcash: forged challenge MAC + cross-sitekey replay must fail.
+        import hashlib as _hashlib
         pow_issuer = ProofOfWorkIssuer(secret_key=b"X" * 32, base_difficulty=12)
-        ch = pow_issuer.issue()
-        sol = solve(ch)
-        ok, why = pow_issuer.verify(ch, sol)
+        sk_a = "0x4PROOF-test-A"
+        sk_b = "0x4PROOF-test-B"
+        telemetry_hash = _hashlib.sha256(b'{"ua":"test"}').hexdigest()
+        ch = pow_issuer.issue(sitekey=sk_a)
+        sol = solve(ch, sitekey=sk_a, telemetry_hash=telemetry_hash)
+        ok, why = pow_issuer.verify(ch, sol, sitekey=sk_a, telemetry_hash=telemetry_hash)
         assert ok, why
+        # Cross-sitekey replay: same solution, sitekey B → must fail.
+        ok_x, _ = pow_issuer.verify(ch, sol, sitekey=sk_b, telemetry_hash=telemetry_hash)
+        assert not ok_x, "cross-sitekey replay should be rejected"
+        # Telemetry-swap attack: same solution, different telemetry → must fail.
+        wrong_th = _hashlib.sha256(b'{"ua":"injected"}').hexdigest()
+        ok_t, _ = pow_issuer.verify(ch, sol, sitekey=sk_a, telemetry_hash=wrong_th)
+        assert not ok_t, "telemetry-swap attack should be rejected"
         # Lower difficulty advertised by client must fail MAC check
         from .proof_of_work import PowChallenge
         forged = PowChallenge(challenge_id=ch.challenge_id, difficulty=4,
                               issued_at=ch.issued_at, expires_at=ch.expires_at,
-                              issuer_mac=ch.issuer_mac)
-        ok2, _ = pow_issuer.verify(forged, sol)
+                              sitekey=sk_a, issuer_mac=ch.issuer_mac)
+        ok2, _ = pow_issuer.verify(forged, sol, sitekey=sk_a, telemetry_hash=telemetry_hash)
         assert not ok2, "downgraded-difficulty challenge should fail MAC"
         # And the underlying primitive itself
-        assert _meets_difficulty(ch.challenge_id, sol.nonce, ch.difficulty)
-        print(f" [ok] proof-of-work issued, solved (nonce={sol.nonce}, "
-              f"difficulty={ch.difficulty}), MAC-tamper rejected")
+        assert _meets_difficulty(ch.challenge_id, sk_a, telemetry_hash, sol.nonce, ch.difficulty)
+        print(f" [ok] proof-of-work bound to (sitekey, telemetry_hash); "
+              f"nonce={sol.nonce}, difficulty={ch.difficulty}, "
+              f"cross-site + telemetry-swap + MAC-tamper rejected")
 
         # Telemetry: clean human vs headless bot
         clean = analyze({
@@ -268,11 +280,16 @@ def main() -> int:
         # Site registration + end-to-end /siteverify-front + /siteverify
         site = proto.sites.register(label="Self-Test", domain="selftest.example")
         assert site.site_key.startswith("0x4PROOF")
-        ch2 = proto.pow.issue()
-        sol2 = solve(ch2)
+        # Independent telemetry hash — for the integration path the test passes
+        # the same hash to both solve() and evaluate_visitor() so the binding
+        # check passes.
+        clean_th = _hashlib.sha256(b'{"clean":"telemetry"}').hexdigest()
+        ch2 = proto.pow.issue(sitekey=site.site_key)
+        sol2 = solve(ch2, sitekey=site.site_key, telemetry_hash=clean_th)
         verdict = proto.evaluate_visitor(
             site_key=site.site_key, challenge=ch2, solution=sol2,
-            telemetry=clean, requester="selftest.example",
+            telemetry=clean, telemetry_hash=clean_th,
+            requester="selftest.example",
         )
         assert verdict["success"], f"clean visitor rejected: {verdict['reasons']}"
         rt = verdict["response_token"]
@@ -287,11 +304,13 @@ def main() -> int:
               f"score={verdict['score']:.1f}, response_token one-time")
 
         # Bot path through the same evaluator must NOT be successful
-        ch3 = proto.pow.issue()
-        sol3 = solve(ch3)
+        bot_th = _hashlib.sha256(b'{"bot":"telemetry"}').hexdigest()
+        ch3 = proto.pow.issue(sitekey=site.site_key)
+        sol3 = solve(ch3, sitekey=site.site_key, telemetry_hash=bot_th)
         bot_verdict = proto.evaluate_visitor(
             site_key=site.site_key, challenge=ch3, solution=sol3,
-            telemetry=bot, requester="selftest.example",
+            telemetry=bot, telemetry_hash=bot_th,
+            requester="selftest.example",
         )
         assert not bot_verdict["success"], \
             f"bot was accepted (action={bot_verdict['action']}, score={bot_verdict['score']:.1f})"
